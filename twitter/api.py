@@ -66,142 +66,88 @@ def fetch_recent_tweets(access_token, query, minutes=SEARCH_WINDOW_MINUTES):
     return data.get("data", [])  # Return list of tweet objects
 
 
-def fetch_conversation_history(access_token, tweet_id, max_tweets=5, tweet_author_id=None):
+def fetch_conversation_history(access_token, tweet_id, max_tweets=5):
     """
-    Fetch conversation history for a given tweet (up to max_tweets previous tweets).
-    Only includes tweets from the tweet author, original poster, or TARGET_USERNAME.
+    Fetch the direct parent tweets (thread lineage) for a given tweet.
+    This returns only the direct parent, grandparent, etc. tweets in the thread,
+    not all replies in the conversation.
     
     Args:
         access_token: Twitter API access token
-        tweet_id: ID of the tweet to get conversation history for
-        max_tweets: Maximum number of previous tweets to fetch
-        tweet_author_id: ID of the author of the tweet (optional)
+        tweet_id: ID of the tweet to get thread lineage for
+        max_tweets: Maximum number of parent tweets to fetch
         
     Returns:
         List of tweet objects in chronological order (oldest first)
     """
-    # First, get the conversation_id for this tweet
     headers = {
         "Authorization": f"Bearer {access_token}"
     }
-    # Get the current tweet to find its conversation_id
-    resp = requests.get(
-        f"{TWITTER_TWEET_URL}/{tweet_id}",
-        params={"tweet.fields": "conversation_id,created_at"},
-        headers=headers
-    )
     
-    if resp.status_code != 200:
-        print(f"Error fetching tweet: {resp.status_code} {resp.text}")
-        return []
-    
-    tweet_data = resp.json().get("data", {})
-    conversation_id = tweet_data.get("conversation_id")
-    
-    # Use the provided tweet_author_id if available
-    current_author_id = tweet_author_id
-    current_author_username = None
-    
-    if not conversation_id:
-        print(f"Could not find conversation_id for tweet {tweet_id}")
-        return []
-    
-    # Get the original tweet in the conversation to find the original author
-    # This is needed to filter tweets by the original poster
-    params = {
-        "query": f"conversation_id:{conversation_id}",
-        "max_results": 10,
-        "tweet.fields": "author_id,created_at",
-        "user.fields": "username",
-        "expansions": "author_id"
-    }
-    
-    resp = requests.get(TWITTER_SEARCH_URL, params=params, headers=headers)
-    
-    if resp.status_code != 200:
-        print(f"Error fetching conversation: {resp.status_code} {resp.text}")
-        return []
-    
-    data = resp.json()
-    all_tweets = data.get("data", [])
-    
-    # Get user information
+    # Dictionary to store all tweets we fetch
+    tweets_by_id = {}
+    # Dictionary to store user information
     users = {}
-    original_author_id = None
-    original_author_username = None
+    # List to track the thread lineage
+    thread_lineage = []
+    # Current tweet ID we're processing
+    current_id = tweet_id
+    # Counter to limit the number of API calls
+    count = 0
     
-    if "includes" in data and "users" in data["includes"]:
-        for user in data["includes"]["users"]:
-            users[user["id"]] = user["username"]
-            # If this user is the author of the current tweet, store their username
-            if user["id"] == current_author_id:
-                current_author_username = user["username"]
-                print(f"Current tweet author: @{current_author_username}")
-    
-    # Find the original tweet (oldest in the conversation)
-    if all_tweets:
-        # Sort by created_at to find the oldest tweet
-        all_tweets.sort(key=lambda x: x.get("created_at", ""))
-        original_author_id = all_tweets[0].get("author_id")
-        original_author_username = users.get(original_author_id, "Unknown")
+    # Continue until we reach max_tweets or can't find any more parent tweets
+    while current_id and count < max_tweets:
+        # Get the current tweet with referenced_tweets expansion
+        resp = requests.get(
+            f"{TWITTER_TWEET_URL}/{current_id}",
+            params={
+                "tweet.fields": "created_at,referenced_tweets",
+                "expansions": "author_id,referenced_tweets.id,referenced_tweets.id.author_id",
+                "user.fields": "username"
+            },
+            headers=headers
+        )
         
-        print(f"Original author of the conversation: @{original_author_username}")
+        if resp.status_code != 200:
+            print(f"Error fetching tweet {current_id}: {resp.status_code} {resp.text}")
+            break
+        
+        data = resp.json()
+        
+        # Store the current tweet
+        if "data" in data:
+            tweet = data["data"]
+            tweets_by_id[tweet["id"]] = tweet
+            
+            # If this isn't the original tweet we're looking for history for, add it to our lineage
+            if tweet["id"] != tweet_id:
+                thread_lineage.append(tweet)
+        
+        # Store user information
+        if "includes" in data and "users" in data["includes"]:
+            for user in data["includes"]["users"]:
+                users[user["id"]] = user["username"]
+        
+        # Store any referenced tweets
+        if "includes" in data and "tweets" in data["includes"]:
+            for ref_tweet in data["includes"]["tweets"]:
+                tweets_by_id[ref_tweet["id"]] = ref_tweet
+        
+        # Find the parent tweet ID (the tweet this one is replying to)
+        parent_id = None
+        if "data" in data and "referenced_tweets" in data["data"]:
+            for ref in data["data"]["referenced_tweets"]:
+                if ref["type"] == "replied_to":
+                    parent_id = ref["id"]
+                    break
+        
+        # Move to the parent tweet for the next iteration
+        current_id = parent_id
+        count += 1
     
-    # Now fetch tweets in this conversation, but only from the original author or TARGET_USERNAME
-    from config import TARGET_USERNAME
-    
-    # Build a query that filters by conversation_id AND (current tweet author OR original author OR TARGET_USERNAME)
-    author_filter = ""
-    
-    # Add current tweet author to filter
-    if current_author_username:
-        author_filter = f"from:{current_author_username}"
-    
-    # Add original conversation author to filter if different from current author
-    if original_author_username and original_author_username != current_author_username:
-        if author_filter:
-            author_filter += f" OR from:{original_author_username}"
-        else:
-            author_filter = f"from:{original_author_username}"
-    
-    # if TARGET_USERNAME:
-    #     if author_filter:
-    #         author_filter += f" OR from:{TARGET_USERNAME}"
-    #     else:
-    #         author_filter = f"from:{TARGET_USERNAME}"
-    
-    # Final query combines conversation_id with author filter
-    query = f"conversation_id:{conversation_id}"
-    if author_filter:
-        query += f" ({author_filter})"
-    
-    print(f"Using filtered query: {query}")
-    
-    params = {
-        "query": query,
-        "max_results": 10,  # Twitter API requires min 10
-        "tweet.fields": "author_id,created_at,in_reply_to_user_id,referenced_tweets",
-        "user.fields": "username",
-        "expansions": "author_id"
-    }
-    
-    resp = requests.get(TWITTER_SEARCH_URL, params=params, headers=headers)
-    
-    if resp.status_code != 200:
-        print(f"Error fetching filtered conversation: {resp.status_code} {resp.text}")
-        return []
-    
-    data = resp.json()
-    tweets = data.get("data", [])
-    
-    # Update user information
-    if "includes" in data and "users" in data["includes"]:
-        for user in data["includes"]["users"]:
-            users[user["id"]] = user["username"]
-    
-    # Format tweets with username
+    # Format the tweets with username information
     formatted_tweets = []
-    for tweet in tweets:
+    for tweet in thread_lineage:
         author_id = tweet.get("author_id")
         username = users.get(author_id, "Unknown")
         
@@ -214,14 +160,6 @@ def fetch_conversation_history(access_token, tweet_id, max_tweets=5, tweet_autho
     
     # Sort by created_at (oldest first)
     formatted_tweets.sort(key=lambda x: x.get("created_at", ""))
-    
-    # Remove the current tweet if it's in the list
-    formatted_tweets = [t for t in formatted_tweets if t["id"] != tweet_id]
-    
-    # Return up to max_tweets (most recent tweets first)
-    if len(formatted_tweets) > max_tweets:
-        print(f"Limiting conversation history from {len(formatted_tweets)} to {max_tweets} tweets")
-        return formatted_tweets[-max_tweets:]
     
     return formatted_tweets
 

@@ -98,7 +98,7 @@ def main():
                 try:
                     # Get the author_id from the tweet
                     author_id = tweet.get("author_id")
-                    conversation_history = fetch_conversation_history(access_token, tweet_id, max_tweets=10, tweet_author_id=author_id)
+                    conversation_history = fetch_conversation_history(access_token, tweet_id, max_tweets=10)
                     
                     if conversation_history:
                         print(f"Found {len(conversation_history)} previous tweets in the conversation")
