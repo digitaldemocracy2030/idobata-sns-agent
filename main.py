@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import time
+import re
 from config import (
     TARGET_USERNAME,
-    POLLING_INTERVAL_SECONDS
+    POLLING_INTERVAL_SECONDS,
+    DEFAULT_PROJECT_ID
 )
 from twitter.auth import get_valid_token
 from twitter.api import build_search_query, fetch_recent_tweets, reply_to_tweet, fetch_conversation_history
 from typing import Optional
-from chat_client.api import generate_reply
 from utils.file_utils import (
     read_target_tweet_ids,
     create_empty_target_file_if_not_exists,
@@ -15,9 +16,35 @@ from utils.file_utils import (
     read_replied_tweet_ids,
     add_replied_tweet_id
 )
+from llm.api import generate_reply
 
 # Twitter's character limit for tweets
 TWITTER_CHAR_LIMIT = 280
+
+def remove_mention_prefix(reply_text: Optional[str]) -> Optional[str]:
+    """
+    Remove Twitter-style mentions (like "@username") from the beginning of reply text.
+    
+    Args:
+        reply_text: The text to process
+        
+    Returns:
+        Text with leading mentions removed, or the original text if no mentions found
+    """
+    if reply_text is None:
+        return None
+    
+    # Regex pattern to match "@username" at the beginning of text
+    pattern = r"^\s*@\w+\s+"
+    
+    # Remove the mention if found
+    cleaned_text = re.sub(pattern, "", reply_text)
+    
+    if cleaned_text != reply_text:
+        print(f"Removed mention prefix from reply")
+    
+    return cleaned_text
+
 
 def truncate_reply_if_needed(reply_text: Optional[str]) -> Optional[str]:
     """
@@ -94,11 +121,11 @@ def main():
                     print(f"Skipping tweet_id={tweet_id} - already replied")
                     continue
                 
-                # Fetch conversation history (up to 10 previous tweets)
+                # Fetch conversation history
                 try:
                     # Get the author_id from the tweet
                     author_id = tweet.get("author_id")
-                    conversation_history = fetch_conversation_history(access_token, tweet_id, max_tweets=10)
+                    conversation_history = fetch_conversation_history(access_token, tweet_id, max_tweets=5)
                     
                     if conversation_history:
                         print(f"Found {len(conversation_history)} previous tweets in the conversation")
@@ -110,13 +137,16 @@ def main():
                     print(f"Error fetching conversation history: {e}")
                     conversation_history = []
 
-                # Generate reply using local chat API with conversation history
-                reply_text = generate_reply(user_text, conversation_history)
+                # Generate reply using Delib API with conversation history
+                reply_text = generate_reply(user_text, conversation_history, DEFAULT_PROJECT_ID)
 
                 # Only post reply if we got a valid response (not None)
                 if reply_text is not None:
+                    # Remove any Twitter-style mentions from the beginning of the reply
+                    cleaned_reply = remove_mention_prefix(reply_text)
+                    
                     # Truncate reply if it exceeds Twitter's character limit
-                    truncated_reply = truncate_reply_if_needed(reply_text)
+                    truncated_reply = truncate_reply_if_needed(cleaned_reply)
                     
                     # Post reply to Twitter
                     reply_success = reply_to_tweet(access_token, tweet_id, truncated_reply)
